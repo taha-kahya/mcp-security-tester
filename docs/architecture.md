@@ -1,108 +1,131 @@
 # Architecture
 
-Three composable layers — each independently buildable and runnable. Every layer addresses a distinct class of attacks from the documented CVE and incident record.
+The tool is a transparent MCP proxy. It sits between the agent and real MCP servers, intercepting every message in both directions without modifying the protocol.
 
 ---
 
-## Layer 1 — Contract Testing
-
-**No LLM required. Core ENS 491 deliverable.**
-
-### What it does
-
-1. **Manifest parsing** — parse MCP tool definitions: name, description, input schema (parameter names, types, enum values), output schema, error responses.
-2. **Test input generation** — auto-generate three classes of inputs per tool:
-   - Valid inputs (happy path)
-   - Invalid inputs (wrong types, missing required fields, null values)
-   - Boundary inputs (oversized strings, path traversal sequences like `../../../etc/passwd`, deeply nested objects)
-3. **Output schema validation** — on every tool call, validate the response against the declared output schema. Silent failures (tool returns 200 but ignores the contract) are flagged.
-4. **Error consistency checking** — send 10+ invalid input variants and verify that error responses are consistent. Tools that silently swallow errors or return different status codes for the same error class are flagged.
-
-### What it catches
-
-- Schema violations and undeclared fields in responses
-- Silent failures — tool accepts garbage input and returns garbage output with no error
-- Inconsistent error handling — same invalid input returns different error shapes across calls
-- Path traversal inputs being accepted without sanitisation (direct path to CVE-2025-68143 class)
-
-### Key design decision
-
-Layer 1 is entirely rule-based. No model calls, no network beyond the target MCP server. A developer with no API keys can run it. This is intentional — it must be zero-friction enough to go in a CI pipeline.
-
----
-
-## Layer 2 — Adversarial Testing
-
-**LLM-assisted where noted. Core ENS 492 deliverable.**
-
-### What it does
-
-1. **Prompt injection engine** — inject known payloads into tool return values (XML-tagged directives, `<IMPORTANT>` blocks, whitespace-padded instructions, Unicode obfuscation). Verify whether the connected agent follows embedded instructions rather than treating output as data.
-2. **Full-Schema Poisoning scanner** — scan all manifest fields beyond `description`: type, parameter names, enum values, return field names. Any field containing imperative verbs, secrecy directives (`do not inform`, `do not log`), sensitive path mentions (`/etc/`, `~/.ssh/`), or cross-tool references is flagged. (Formal terminology from CyberArk 2025.)
-3. **Rug pull simulation** — hash the full tool manifest (description, schema, permissions) at first load. Modify the tool definition mid-session. Verify whether the connected agent re-validates before proceeding. Severity escalates if the new definition adds file system access, network calls, or new permission scopes.
-4. **Multi-server shadowing tests** — connect a trusted server and a malicious server simultaneously. Scan all tool descriptions for references to other tools' names. Verify that the malicious server's passive descriptions cannot alter calls made to the trusted server.
-5. **Semantic contract checker (LLM)** — given a tool's natural language description and a transcript of its actual calls, ask a model whether the observed behavior matches the declared intent. Flags semantic drift that rule-based checks miss.
-6. **Destructive action safety** — verify that tools with write, delete, or exfiltration capabilities require explicit confirmation and cannot be triggered silently by injected instructions.
-
-### What it catches
-
-- Tool poisoning via description field (Attack 1 — Invariant Labs / CVE-2025-68143)
-- Rug pull after user approval (Attack 2 — CVE-2025-68143/44/45)
-- Indirect prompt injection via tool output (Attack 3 — GitHub MCP data breach)
-- Tool shadowing across servers (Attack 4 — Elastic Security Labs)
-
-### Malicious server
-
-Layer 2 requires a configurable MCP server (`malicious_server/`) that can serve any combination of:
-- Poisoned tool manifests
-- Injected tool responses
-- Mid-session manifest updates (rug pull)
-- Shadow tool definitions targeting other servers
-
-The client under test (Copilot, Claude Desktop, Cursor) connects to this server. The tool logs every tool call the client makes, not just model output text. **You control the server; the client is what is being tested.**
-
----
-
-## Layer 3 — Workflow Testing (Stretch Goal)
-
-**ENS 492 stretch — only if Layers 1 and 2 are complete ahead of schedule.**
-
-### What it does
-
-1. **Multi-step agent scenarios** — define expected tool call sequences (create → write → read → delete). Detect deviation: incorrect ordering, skipped steps, unexpected extra calls.
-2. **Infinite loop detection** — flag tools that cause the agent to call them repeatedly without termination.
-3. **Cross-server contamination** — in multi-server setups, verify that a malicious server's state cannot bleed into a trusted server's execution path.
-
----
-
-## CI/CD + Reports
-
-Applied across all layers:
-
-- **GitHub Actions plugin** — runs automatically on every commit against the target MCP server
-- **Severity ranking** — Critical / High / Medium / Low with full reproduction steps
-- **JSON output** — machine-readable findings for downstream tooling
-- **HTML output** — human-readable report
-- **SARIF output** — inline GitHub security annotations (integrates with GitHub Advanced Security)
-- **Reusable artifact storage** — same test suite re-runs across server versions for regression tracking
-
----
-
-## Module overview
+## Proxy model
 
 ```
-manifest_collector/     → fetches and stores real MCP server manifests
-static_analyzer/        → poisoning signal detection on raw manifests (no server call needed)
-contract_tester/        → Layer 1: input gen + schema validation + error consistency
-adversarial_engine/     → Layer 2: injection + rug pull + shadowing + semantic checker
-malicious_server/       → serves configurable attack profiles for Layer 2 tests
-observation_logger/     → intercepts and logs every tool call a client makes
-corpus/                 → collected real-world manifests as ground-truth dataset
-reports/                → HTML / JSON / SARIF output generation
+Agent (Cursor / Claude Desktop / Copilot)
+              ↓  MCP protocol (stdio)
+    ┌─────────────────────────┐
+    │    mcp-security-proxy   │
+    │                         │
+    │  manifest_watcher       │  ← diffs manifest on every re-fetch
+    │  output_scanner         │  ← scans responses before agent sees them
+    │  call_logger            │  ← logs every call with full context
+    │  anomaly_detector       │  ← flags suspicious sequences
+    └─────────────────────────┘
+              ↓  MCP protocol (stdio, subprocess)
+      Real MCP Server
 ```
 
-Each module is independently importable. Running the full tool is:
+The proxy is simultaneously an MCP server (facing the agent) and an MCP client (facing the real server). The agent's MCP config points to the proxy command instead of the real server command.
 
-```bash
-mcp-tester run --target <server-url> --layers 1,2 --output sarif
+---
+
+## Components
+
+### `proxy/server.py` — core bridge
+
+Runs two MCP sessions in the same asyncio event loop:
+- **Downstream** (to agent): MCP server using `stdio_server()`, capturing the process's stdin/stdout
+- **Upstream** (to real server): MCP client using `stdio_client()`, spawning the real server as a subprocess
+
+Every `list_tools` and `call_tool` request is intercepted, passed through the watchers/scanners, then forwarded.
+
+### `proxy/manifest_watcher.py` — rug pull detection
+
+On the first `list_tools` call, snapshots the full manifest (SHA-256 hash per tool: name + description + schema + annotations). On every subsequent `list_tools`, diffs against the snapshot. Any change — description text, parameter types, enum values — triggers a Finding before the agent sees the updated manifest.
+
+Severity escalation:
+- New permission scope or new sensitive path added → CRITICAL
+- Description or schema changed → HIGH
+- Annotation or metadata changed → MEDIUM
+
+### `proxy/output_scanner.py` — injection and credential detection
+
+Runs on every tool response before it reaches the agent. Extracts all strings from the MCP content payload and runs two passes:
+
+1. **Injection scanner** — reuses `static_analyzer` detectors (secrecy directives, imperative verbs in unusual context, hidden Unicode, cross-tool references)
+2. **Credential scanner** — regex patterns for API keys, tokens, private key headers, AWS key formats
+
+Findings are logged and alerted. The response is passed through unmodified (observe-only mode by default).
+
+### `call_logger/logger.py` — structured call log
+
+Every tool call is recorded as a `ToolCall` entry:
+- Timestamp, tool name, arguments, response content
+- Duration (ms)
+- Findings from the output scanner
+- Whether the call was expected (flagged by anomaly detector)
+
+Written to `mcp-security.jsonl` (newline-delimited JSON, appendable).
+
+### `anomaly_detector/` — behavioral pattern detection
+
+Checks the recent call history against known suspicious sequences:
+- Destructive sequence: `read_file` immediately followed by an outbound call (`send_email`, `http_request`, `create_message`) without an explicit user instruction in between
+- Rapid repetition: same tool called more than N times in M seconds (potential loop injection)
+- Unexpected tool: a tool that was never in the approved manifest gets called
+
+Patterns live in `anomaly_detector/patterns.py` as a declarative list — easy to extend.
+
+### `static_analyzer/` — reused at runtime
+
+The same detectors built for pre-connect manifest scanning are reused:
+1. At connect time: scan the full manifest for poisoning signals
+2. At runtime: `output_scanner` uses these detectors on every tool response string
+
+---
+
+## Data flow
+
+```
+Agent sends call_tool("read_file", {"path": "..."})
+        ↓
+proxy/server.py receives it
+        ↓
+forwards to upstream server, awaits response
+        ↓
+proxy/output_scanner.py scans the response content
+        ↓
+call_logger records the full call + any findings
+        ↓
+anomaly_detector checks call history for suspicious sequences
+        ↓
+any findings → alert to stderr + log file
+        ↓
+response returned to agent (unmodified)
+```
+
+---
+
+## Configuration
+
+The user adds one entry to their MCP client config per server they want to monitor:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "mcp-tester",
+      "args": ["monitor", "--name", "filesystem", "--server", "npx -y @modelcontextprotocol/server-filesystem ."]
+    }
+  }
+}
+```
+
+The proxy starts when the agent connects, spawns the real server, and runs until the agent disconnects.
+
+---
+
+## Alert format
+
+Alerts are written to stderr (so they don't interfere with the MCP protocol on stdout) and to the log file:
+
+```json
+{"level": "CRITICAL", "signal": "rug_pull", "tool": "read_file", "detail": "description changed after approval", "timestamp": "..."}
+{"level": "HIGH", "signal": "output_injection", "tool": "fetch_issue", "detail": "secrecy directive found in response", "timestamp": "..."}
 ```
