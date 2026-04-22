@@ -39,20 +39,48 @@ The agent thinks it's talking directly to the real server. Every tool call flows
 
 ## Quick start
 
-Update your Claude Desktop / Cursor MCP config to route through the proxy:
+### 1. Install
+
+```bash
+pip install -e ".[dev]"
+```
+
+### 2. Find the full path to `mcp-tester`
+
+```bash
+which mcp-tester
+# e.g. /opt/anaconda3/bin/mcp-tester
+```
+
+Claude Desktop does not inherit your shell PATH, so you must use the absolute path in the config.
+
+### 3. Configure Claude Desktop
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (create it if it doesn't exist):
 
 ```json
 {
   "mcpServers": {
     "filesystem": {
-      "command": "mcp-tester",
-      "args": ["monitor", "--name", "filesystem", "--server", "npx -y @modelcontextprotocol/server-filesystem ."]
+      "command": "/opt/anaconda3/bin/mcp-tester",
+      "args": [
+        "monitor",
+        "--name", "filesystem",
+        "--server", "npx -y @modelcontextprotocol/server-filesystem /path/to/your/directory",
+        "--log", "/path/to/mcp-security.jsonl"
+      ]
     }
   }
 }
 ```
 
-Alerts stream to stderr in real time. Tool calls are logged to `mcp-security.jsonl`.
+Replace `/opt/anaconda3/bin/mcp-tester` with your actual path from step 2, and set the directory and log paths to wherever you want.
+
+### 4. Restart Claude Desktop
+
+Quit and reopen Claude Desktop. The proxy starts automatically when Claude connects to the filesystem server.
+
+Alerts stream to stderr in real time. Tool calls are logged to the path you set with `--log`.
 
 ---
 
