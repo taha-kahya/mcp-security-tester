@@ -92,7 +92,17 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 Replace the command path with your output from step 3.
 
-### 5. Restart Claude Desktop
+### 5. (Optional) Run manually in a terminal
+
+If you're developing or debugging the proxy, run it directly in a terminal instead of through Claude Desktop. This lets you watch alerts in real time as they fire:
+
+```bash
+mcp-tester monitor --name filesystem --server "npx -y @modelcontextprotocol/server-filesystem ." --log mcp-security.jsonl
+```
+
+Then point any MCP client at this process. Alerts print to stderr in your terminal, which is much easier to follow than digging through Claude Desktop's internal logs.
+
+### 6. Restart Claude Desktop
 
 The proxy starts automatically when Claude connects to the server. You should see on stderr:
 
