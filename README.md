@@ -96,6 +96,15 @@ Alerts stream to stderr in real time. Tool calls are logged to the path you set 
 
 See [docs/attacks.md](docs/attacks.md) for payloads and detection logic.
 
+## Known limitations
+
+These are gaps in current coverage — understanding them prevents over-relying on the tool:
+
+- **Tool arguments are not scanned.** An injected instruction that passes a sensitive path as an argument (e.g. `read_file("/etc/passwd")`) is logged but not flagged. Only tool outputs and manifest descriptions are scanned.
+- **Credential detection is partial.** GitHub, OpenAI, AWS, and private keys are covered. Azure, Google Cloud, and Slack tokens are not yet matched.
+- **Tool shadowing is connect-time only.** Shadowing introduced via a runtime tool output is caught as generic prompt injection, not classified as shadowing.
+- **Sequence patterns are limited.** Only 4 rules are defined. Coverage will improve as patterns are tuned against real captured sessions.
+
 ---
 
 ## Project structure
